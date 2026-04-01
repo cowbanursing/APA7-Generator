@@ -11,11 +11,9 @@ if 'bib_list' not in st.session_state: st.session_state.bib_list = []
 if 'temp_fetch' not in st.session_state: st.session_state.temp_fetch = None
 if 'temp_manual' not in st.session_state: st.session_state.temp_manual = None
 
-# 手動輸入欄位的預設值 (為了讓華藝爬蟲可以自動預填)
 keys_to_init = ['m_auth_val', 'm_year_val', 'm_title_val', 'm_jou_val', 'm_vol_val', 'm_iss_val', 'm_page_val', 'm_link_val']
 for k in keys_to_init:
-    if k not in st.session_state:
-        st.session_state[k] = ""
+    if k not in st.session_state: st.session_state[k] = ""
 
 # 自訂 CSS：醫療綠風格
 st.markdown("""
@@ -66,11 +64,9 @@ def build_apa7(auth, year, title, jou, vol, iss, page, link):
     return ref.replace("..", ".")
 
 def parse_doi(text):
-    # 強化版 DOI 辨識：清理首尾多餘字元與斜線
     text = text.strip()
     match = re.search(r'(10\.\d{4,9}/[-._;()/:a-zA-Z0-9]+)', text)
-    if match:
-        return match.group(1).rstrip('."\'<>/')
+    if match: return match.group(1).rstrip('."\'<>/')
     return None
 
 def parse_pubmed_id(text):
@@ -101,6 +97,62 @@ def fetch_crossref(doi):
             return ref, paren, narr, auth_str
     except: return None
 
+# --- 新增：DOI 降落傘機制 (抓取 Meta Tags) ---
+def fetch_doi_metadata_fallback(doi):
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    }
+    url = f"https://doi.org/{doi}"
+    try:
+        res = requests.get(url, headers=headers, allow_redirects=True, timeout=15)
+        if res.status_code != 200: return None
+        
+        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        title = ""
+        meta_title = soup.find("meta", attrs={"name": "citation_title"})
+        if meta_title: title = meta_title.get("content", "")
+        
+        raw_auths = []
+        for tag in soup.find_all("meta", attrs={"name": "citation_author"}):
+            auth_content = tag.get("content", "")
+            if auth_content:
+                # 簡單處理中文或英文姓名拆分
+                parts = auth_content.split(',')
+                if len(parts) == 2:
+                    raw_auths.append((parts[0].strip(), parts[1].strip()[0] if parts[1].strip() else ""))
+                else:
+                    parts = auth_content.split(' ')
+                    if len(parts) >= 2: raw_auths.append((parts[0], parts[1][0]))
+                    else: raw_auths.append((auth_content, ""))
+                        
+        if not title and not raw_auths: return None
+            
+        jou_tag = soup.find("meta", attrs={"name": "citation_journal_title"})
+        jou = jou_tag.get("content", "") if jou_tag else ""
+        
+        date_tag = soup.find("meta", attrs={"name": "citation_publication_date"})
+        year = date_tag.get("content", "")[:4] if date_tag else "n.d."
+        
+        vol_tag = soup.find("meta", attrs={"name": "citation_volume"})
+        vol = vol_tag.get("content", "") if vol_tag else ""
+        
+        iss_tag = soup.find("meta", attrs={"name": "citation_issue"})
+        iss = iss_tag.get("content", "") if iss_tag else ""
+        
+        fp_tag = soup.find("meta", attrs={"name": "citation_firstpage"})
+        lp_tag = soup.find("meta", attrs={"name": "citation_lastpage"})
+        page = ""
+        if fp_tag and lp_tag: page = f"{fp_tag.get('content', '')}-{lp_tag.get('content', '')}"
+        elif fp_tag: page = fp_tag.get('content', '')
+            
+        auth_str, last_names = format_authors(raw_auths)
+        paren, narr = build_in_text(last_names, year)
+        ref = build_apa7(auth_str, year, title, jou, vol, iss, page, url)
+        
+        return ref, paren, narr, auth_str
+    except: return None
+
 def fetch_pubmed(pmid):
     try:
         url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&id={pmid}&retmode=json"
@@ -129,52 +181,31 @@ def fetch_pubmed(pmid):
             return ref, paren, narr, auth_str
     except: return None
 
-# --- 華藝專用爬蟲函數 ---
+# --- 華藝專用爬蟲函數 (手動區塊外掛) ---
 def fetch_airiti_autofill(url):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7'
     }
     try:
         res = requests.get(url, headers=headers, timeout=15)
-        if res.status_code != 200:
-            return {"error": f"伺服器阻擋了請求 (狀態碼: {res.status_code})"}
+        if res.status_code != 200: return {"error": f"伺服器阻擋了請求 (狀態碼: {res.status_code})"}
         
-        # 策略 1: 在整個 HTML 中暴力搜尋 DOI
         doi_match = re.search(r'(10\.\d{4,9}/[-._;()/:a-zA-Z0-9]+)', res.text)
         if doi_match:
             doi = doi_match.group(1).rstrip('."\'<>/')
-            # 拿到了 DOI，直接呼叫 Crossref 取得最準確的資料來預填
-            c_res = requests.get(f"https://api.crossref.org/works/{doi}", timeout=10)
-            if c_res.status_code == 200:
-                data = c_res.json()['message']
-                year = str(data.get('issued', {}).get('date-parts', [[None]])[0][0]) if data.get('issued') else ""
-                if year == "None": year = ""
-                title = data.get('title', [''])[0]
-                journal = data.get('container-title', [''])[0]
-                vol = data.get('volume', '')
-                iss = data.get('issue', '')
-                page = data.get('page', '')
-                
-                raw_auths = []
-                for a in data.get('author', []):
-                    family = a.get('family', '')
-                    given = a.get('given', '')
-                    if family: raw_auths.append((family, given[0] if given else ""))
-                
-                auth_str, _ = format_authors(raw_auths)
-                return {"auth": auth_str, "year": year, "title": title, "jou": journal, "vol": vol, "iss": iss, "page": page, "link": f"https://doi.org/{doi}", "source": "DOI"}
+            c_res = fetch_crossref(doi)
+            if not c_res:
+                c_res = fetch_doi_metadata_fallback(doi) # 連動降落傘機制
+            
+            if c_res:
+                ref, paren, narr, auth_str = c_res
+                # 從產生的 ref 中簡單反推欄位，或是直接請使用者填寫
+                return {"auth": auth_str, "year": "請參考上方結果", "title": "已抓取 DOI 資料", "jou": "", "vol": "", "iss": "", "page": "", "link": f"https://doi.org/{doi}", "source": "DOI"}
 
-        # 策略 2: 如果沒有 DOI，啟動 Beautiful Soup 硬爬 HTML
         soup = BeautifulSoup(res.text, 'html.parser')
-        
         title = ""
-        meta_title = soup.find("meta", attrs={"name": "citation_title"}) or soup.find("meta", property="og:title")
+        meta_title = soup.find("meta", attrs={"name": "citation_title"})
         if meta_title: title = meta_title.get("content", "")
-        else:
-            title_h1 = soup.find('h1')
-            if title_h1: title = title_h1.text.strip()
             
         auths = []
         for tag in soup.find_all("meta", attrs={"name": "citation_author"}):
@@ -196,20 +227,16 @@ def fetch_airiti_autofill(url):
         fp_tag = soup.find("meta", attrs={"name": "citation_firstpage"})
         lp_tag = soup.find("meta", attrs={"name": "citation_lastpage"})
         page = ""
-        if fp_tag and lp_tag: 
-            page = f"{fp_tag.get('content', '')}-{lp_tag.get('content', '')}"
-        elif fp_tag: 
-            page = fp_tag.get('content', '')
+        if fp_tag and lp_tag: page = f"{fp_tag.get('content', '')}-{lp_tag.get('content', '')}"
+        elif fp_tag: page = fp_tag.get('content', '')
 
-        if not title:
-            return {"error": "網頁可能被防護機制擋下，或是該頁面結構無法解析，請手動填寫喔！"}
+        if not title: return {"error": "網頁結構無法解析，請手動填寫喔！"}
 
         return {"auth": auth_str, "year": year, "title": title, "jou": jou, "vol": vol, "iss": iss, "page": page, "link": url, "source": "HTML"}
-        
     except Exception as e:
         return {"error": f"發生未知的系統錯誤: {str(e)}"}
 
-# --- 解決按鈕消失的 Callback 函數 ---
+# --- Callback 函數 ---
 def add_fetch_to_box():
     st.session_state.bib_list.append({
         "ref": st.session_state.temp_fetch[0], 
@@ -233,7 +260,7 @@ with st.sidebar:
 # --- 4. 頁面 1：產生成果 ---
 if page == "1. 產生成果 (自動/手動)":
     st.title("🔗 自動抓取文獻")
-    st.markdown("<div class='mascot-dialog'><b>主角：</b>學長姐辛苦了！把含有 DOI 的完整網址 (例如 https://doi.org/10...) 或 PubMed 網址丟進來，我秒速幫你處理！</div>", unsafe_allow_html=True)
+    st.markdown("<div class='mascot-dialog'><b>主角：</b>學長姐辛苦了！把含有 DOI 的完整網址或 PubMed 網址丟進來，我秒速幫你處理！</div>", unsafe_allow_html=True)
     
     user_input = st.text_input("輸入網址或 DOI：", placeholder="例如: https://doi.org/10.29806/TM.201002.0005")
     
@@ -246,8 +273,15 @@ if page == "1. 產生成果 (自動/手動)":
                 pmid_match = parse_pubmed_id(user_input)
                 
                 if doi_match:
+                    # 第一關：Crossref
                     st.session_state.temp_fetch = fetch_crossref(doi_match)
-                    if not st.session_state.temp_fetch: st.error("主角：靠北，雖然抓到 DOI 碼，但國際資料庫裡找不到這篇捏！")
+                    if not st.session_state.temp_fetch:
+                        # 第二關：啟動降落傘機制 (網頁轉址 Meta 爬蟲)
+                        st.session_state.temp_fetch = fetch_doi_metadata_fallback(doi_match)
+                    
+                    if not st.session_state.temp_fetch: 
+                        st.error("主角：靠北，Crossref 找不到，連追蹤網頁也抓不到資料，這篇藏得太深了！")
+                
                 elif pmid_match:
                     st.session_state.temp_fetch = fetch_pubmed(pmid_match)
                     if not st.session_state.temp_fetch: st.error("主角：PubMed 伺服器沒有回應，請稍後再試！")
@@ -277,7 +311,6 @@ if page == "1. 產生成果 (自動/手動)":
     st.title("✍️ 完整版手動輸入 (附華藝懶人包)")
     st.markdown("<div class='mascot-dialog'><b>主角：</b>如果是死都不讓我抓的文章，就在這裡填吧！有華藝網址也可以用我的外掛試試看！</div>", unsafe_allow_html=True)
     
-    # --- 新增：華藝懶人包區塊 ---
     with st.expander("🇹🇼 華藝懶人包 (Airiti Auto-fill) 試運轉", expanded=True):
         st.write("把華藝的網址貼在下面，主角會嘗試幫你把下方的欄位填滿！")
         airiti_url = st.text_input("華藝網址：", placeholder="例如: https://www.airitilibrary.com/Article/Detail?DocID=...")
@@ -289,7 +322,6 @@ if page == "1. 產生成果 (自動/手動)":
                         st.error(f"主角：靠北，被擋下來了！錯誤訊息：{res_data['error']}")
                     else:
                         st.success(f"主角：成功突圍！(資料來源: {res_data.get('source', '解析')}) 幫您把資料填在下方欄位了，請檢查修改！")
-                        # 將抓到的資料寫入 session_state，讓下方的輸入框自動更新
                         st.session_state.m_auth_val = res_data.get('auth', '')
                         st.session_state.m_year_val = res_data.get('year', '')
                         st.session_state.m_title_val = res_data.get('title', '')
@@ -301,10 +333,9 @@ if page == "1. 產生成果 (自動/手動)":
             else:
                 st.warning("主角：學長姐，這看起來不像華藝的網址捏！")
 
-    # --- 綁定 session_state 的手動輸入欄位 ---
     col1, col2 = st.columns(2)
     with col1:
-        m_auth = st.text_input("👥 作者群 (請用 '&' 或逗號分隔)", key="m_auth_val", placeholder="例如: 王小明, & 李大華 或 Smith, J., & Doe, A.")
+        m_auth = st.text_input("👥 作者群 (請用 '&' 或逗號分隔)", key="m_auth_val", placeholder="例如: 王小明, & 李大華")
         m_year = st.text_input("📅 出版年份", key="m_year_val", placeholder="例如: 2026")
         m_title = st.text_area("📄 文章標題", key="m_title_val", placeholder="例如: 台灣護理師職場暴力之探討")
     with col2:
@@ -316,7 +347,6 @@ if page == "1. 產生成果 (自動/手動)":
         m_link = st.text_input("🔗 網址或 DOI (選填)", key="m_link_val", placeholder="例如: https://doi.org/10.xxxx")
 
     if st.button("✨ 確認無誤，手動組合三合一格式"):
-        # 從 session_state 讀取最新修改的值
         current_auth = st.session_state.m_auth_val
         current_title = st.session_state.m_title_val
         
