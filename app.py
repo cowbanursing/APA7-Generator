@@ -6,13 +6,16 @@ from bs4 import BeautifulSoup
 # --- 1. 網頁基礎設定 ---
 st.set_page_config(page_title="APA 7 產生器 & 排序小幫手", page_icon="💉", layout="wide")
 
-# 初始化所有的暫存區
-if 'bib_list' not in st.session_state:
-    st.session_state.bib_list = []
-if 'temp_fetch' not in st.session_state:
-    st.session_state.temp_fetch = None
-if 'temp_manual' not in st.session_state:
-    st.session_state.temp_manual = None
+# 初始化所有的暫存區與手動欄位狀態
+if 'bib_list' not in st.session_state: st.session_state.bib_list = []
+if 'temp_fetch' not in st.session_state: st.session_state.temp_fetch = None
+if 'temp_manual' not in st.session_state: st.session_state.temp_manual = None
+
+# 手動輸入欄位的預設值 (為了讓華藝爬蟲可以自動預填)
+keys_to_init = ['m_auth_val', 'm_year_val', 'm_title_val', 'm_jou_val', 'm_vol_val', 'm_iss_val', 'm_page_val', 'm_link_val']
+for k in keys_to_init:
+    if k not in st.session_state:
+        st.session_state[k] = ""
 
 # 自訂 CSS：醫療綠風格
 st.markdown("""
@@ -63,8 +66,12 @@ def build_apa7(auth, year, title, jou, vol, iss, page, link):
     return ref.replace("..", ".")
 
 def parse_doi(text):
-    match = re.search(r'(10\.\d{4,9}/[-._;()/:A-Z0-9]+)', text, re.IGNORECASE)
-    return match.group(1) if match else None
+    # 強化版 DOI 辨識：清理首尾多餘字元與斜線
+    text = text.strip()
+    match = re.search(r'(10\.\d{4,9}/[-._;()/:a-zA-Z0-9]+)', text)
+    if match:
+        return match.group(1).rstrip('."\'<>/')
+    return None
 
 def parse_pubmed_id(text):
     match = re.search(r'pubmed\.ncbi\.nlm\.nih\.gov/(\d+)', text)
@@ -122,17 +129,95 @@ def fetch_pubmed(pmid):
             return ref, paren, narr, auth_str
     except: return None
 
+# --- 華藝專用爬蟲函數 ---
+def fetch_airiti_autofill(url):
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7'
+    }
+    try:
+        res = requests.get(url, headers=headers, timeout=15)
+        if res.status_code != 200:
+            return {"error": f"伺服器阻擋了請求 (狀態碼: {res.status_code})"}
+        
+        # 策略 1: 在整個 HTML 中暴力搜尋 DOI
+        doi_match = re.search(r'(10\.\d{4,9}/[-._;()/:a-zA-Z0-9]+)', res.text)
+        if doi_match:
+            doi = doi_match.group(1).rstrip('."\'<>/')
+            # 拿到了 DOI，直接呼叫 Crossref 取得最準確的資料來預填
+            c_res = requests.get(f"https://api.crossref.org/works/{doi}", timeout=10)
+            if c_res.status_code == 200:
+                data = c_res.json()['message']
+                year = str(data.get('issued', {}).get('date-parts', [[None]])[0][0]) if data.get('issued') else ""
+                if year == "None": year = ""
+                title = data.get('title', [''])[0]
+                journal = data.get('container-title', [''])[0]
+                vol = data.get('volume', '')
+                iss = data.get('issue', '')
+                page = data.get('page', '')
+                
+                raw_auths = []
+                for a in data.get('author', []):
+                    family = a.get('family', '')
+                    given = a.get('given', '')
+                    if family: raw_auths.append((family, given[0] if given else ""))
+                
+                auth_str, _ = format_authors(raw_auths)
+                return {"auth": auth_str, "year": year, "title": title, "jou": journal, "vol": vol, "iss": iss, "page": page, "link": f"https://doi.org/{doi}", "source": "DOI"}
+
+        # 策略 2: 如果沒有 DOI，啟動 Beautiful Soup 硬爬 HTML
+        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        title = ""
+        meta_title = soup.find("meta", attrs={"name": "citation_title"}) or soup.find("meta", property="og:title")
+        if meta_title: title = meta_title.get("content", "")
+        else:
+            title_h1 = soup.find('h1')
+            if title_h1: title = title_h1.text.strip()
+            
+        auths = []
+        for tag in soup.find_all("meta", attrs={"name": "citation_author"}):
+            auths.append(tag.get("content", ""))
+        auth_str = ", ".join(auths)
+        
+        jou_tag = soup.find("meta", attrs={"name": "citation_journal_title"})
+        jou = jou_tag.get("content", "") if jou_tag else ""
+        
+        date_tag = soup.find("meta", attrs={"name": "citation_publication_date"})
+        year = date_tag.get("content", "")[:4] if date_tag else ""
+        
+        vol_tag = soup.find("meta", attrs={"name": "citation_volume"})
+        vol = vol_tag.get("content", "") if vol_tag else ""
+        
+        iss_tag = soup.find("meta", attrs={"name": "citation_issue"})
+        iss = iss_tag.get("content", "") if iss_tag else ""
+        
+        fp_tag = soup.find("meta", attrs={"name": "citation_firstpage"})
+        lp_tag = soup.find("meta", attrs={"name": "citation_lastpage"})
+        page = ""
+        if fp_tag and lp_tag: 
+            page = f"{fp_tag.get('content', '')}-{lp_tag.get('content', '')}"
+        elif fp_tag: 
+            page = fp_tag.get('content', '')
+
+        if not title:
+            return {"error": "網頁可能被防護機制擋下，或是該頁面結構無法解析，請手動填寫喔！"}
+
+        return {"auth": auth_str, "year": year, "title": title, "jou": jou, "vol": vol, "iss": iss, "page": page, "link": url, "source": "HTML"}
+        
+    except Exception as e:
+        return {"error": f"發生未知的系統錯誤: {str(e)}"}
+
 # --- 解決按鈕消失的 Callback 函數 ---
 def add_fetch_to_box():
-    # 修復 BUG：temp_fetch 是一個 Tuple (ref, paren, narr, auth_str)，所以用數字索引
     st.session_state.bib_list.append({
         "ref": st.session_state.temp_fetch[0], 
         "author": st.session_state.temp_fetch[3]
     })
-    st.session_state.temp_fetch = None # 清除暫存畫面
+    st.session_state.temp_fetch = None
 
 def add_manual_to_box():
-    # temp_manual 是一個 Dictionary，所以用字串索引
     st.session_state.bib_list.append({
         "ref": st.session_state.temp_manual['ref'], 
         "author": st.session_state.temp_manual['author']
@@ -148,9 +233,9 @@ with st.sidebar:
 # --- 4. 頁面 1：產生成果 ---
 if page == "1. 產生成果 (自動/手動)":
     st.title("🔗 自動抓取文獻")
-    st.markdown("<div class='mascot-dialog'><b>主角：</b>學長姐辛苦了！把 DOI、PubMed 網址，或是華藝網址丟進來，我來幫你想辦法！</div>", unsafe_allow_html=True)
+    st.markdown("<div class='mascot-dialog'><b>主角：</b>學長姐辛苦了！把含有 DOI 的完整網址 (例如 https://doi.org/10...) 或 PubMed 網址丟進來，我秒速幫你處理！</div>", unsafe_allow_html=True)
     
-    user_input = st.text_input("輸入網址或 DOI：", placeholder="例如: https://pubmed.ncbi.nlm.nih.gov/36669781/ 或 DOI碼")
+    user_input = st.text_input("輸入網址或 DOI：", placeholder="例如: https://doi.org/10.29806/TM.201002.0005")
     
     if st.button("🚀 呼叫主角抓資料"):
         if not user_input:
@@ -162,16 +247,17 @@ if page == "1. 產生成果 (自動/手動)":
                 
                 if doi_match:
                     st.session_state.temp_fetch = fetch_crossref(doi_match)
+                    if not st.session_state.temp_fetch: st.error("主角：靠北，雖然抓到 DOI 碼，但國際資料庫裡找不到這篇捏！")
                 elif pmid_match:
                     st.session_state.temp_fetch = fetch_pubmed(pmid_match)
+                    if not st.session_state.temp_fetch: st.error("主角：PubMed 伺服器沒有回應，請稍後再試！")
                 elif "airiti" in user_input.lower():
-                    st.error("主角：靠北，華藝的防護牆太厚了... 請學長姐直接把資料貼到下方『完整版手動區塊』！")
+                    st.error("主角：華藝的文章請到下方的『手動輸入區』使用【華藝懶人包】外掛來處理喔！")
                     st.session_state.temp_fetch = None
                 else:
-                    st.error("主角：這網址我看不太懂捏，試試看手動輸入吧！")
+                    st.error("主角：這網址我看不太懂捏，試著用下方的【華藝懶人包】或是直接手動輸入吧！")
                     st.session_state.temp_fetch = None
 
-    # 展示自動抓取的「三合一」結果
     if st.session_state.temp_fetch:
         ref, paren, narr, auth_for_sort = st.session_state.temp_fetch
         st.success("主角：搞定！幫您排好版了！")
@@ -184,39 +270,69 @@ if page == "1. 產生成果 (自動/手動)":
         st.markdown("**🗣️ 敘述式引用 (Narrative Citation)**")
         st.code(narr, language="markdown")
         
-        # 使用 callback 避免畫面重整資料消失
         st.button("📥 加入我的文獻箱 (排序用)", on_click=add_fetch_to_box, type="primary")
 
     st.divider()
     
-    st.title("✍️ 完整版手動輸入")
-    st.markdown("<div class='mascot-dialog'><b>主角：</b>如果是死都不讓我抓的文章，就在這裡手動填吧！欄位我都準備好了！</div>", unsafe_allow_html=True)
+    st.title("✍️ 完整版手動輸入 (附華藝懶人包)")
+    st.markdown("<div class='mascot-dialog'><b>主角：</b>如果是死都不讓我抓的文章，就在這裡填吧！有華藝網址也可以用我的外掛試試看！</div>", unsafe_allow_html=True)
     
+    # --- 新增：華藝懶人包區塊 ---
+    with st.expander("🇹🇼 華藝懶人包 (Airiti Auto-fill) 試運轉", expanded=True):
+        st.write("把華藝的網址貼在下面，主角會嘗試幫你把下方的欄位填滿！")
+        airiti_url = st.text_input("華藝網址：", placeholder="例如: https://www.airitilibrary.com/Article/Detail?DocID=...")
+        if st.button("🪄 嘗試自動填寫下方欄位"):
+            if "airiti" in airiti_url.lower() or "doi.org" in airiti_url.lower():
+                with st.spinner("主角戴上鋼盔，準備衝撞華藝的防火牆..."):
+                    res_data = fetch_airiti_autofill(airiti_url)
+                    if "error" in res_data:
+                        st.error(f"主角：靠北，被擋下來了！錯誤訊息：{res_data['error']}")
+                    else:
+                        st.success(f"主角：成功突圍！(資料來源: {res_data.get('source', '解析')}) 幫您把資料填在下方欄位了，請檢查修改！")
+                        # 將抓到的資料寫入 session_state，讓下方的輸入框自動更新
+                        st.session_state.m_auth_val = res_data.get('auth', '')
+                        st.session_state.m_year_val = res_data.get('year', '')
+                        st.session_state.m_title_val = res_data.get('title', '')
+                        st.session_state.m_jou_val = res_data.get('jou', '')
+                        st.session_state.m_vol_val = res_data.get('vol', '')
+                        st.session_state.m_iss_val = res_data.get('iss', '')
+                        st.session_state.m_page_val = res_data.get('page', '')
+                        st.session_state.m_link_val = res_data.get('link', '')
+            else:
+                st.warning("主角：學長姐，這看起來不像華藝的網址捏！")
+
+    # --- 綁定 session_state 的手動輸入欄位 ---
     col1, col2 = st.columns(2)
     with col1:
-        m_auth = st.text_input("👥 作者群 (請用 '&' 或逗號分隔)", placeholder="例如: 王小明, & 李大華 或 Smith, J., & Doe, A.")
-        m_year = st.text_input("📅 出版年份", placeholder="例如: 2026")
-        m_title = st.text_area("📄 文章標題", placeholder="例如: 台灣護理師職場暴力之探討")
+        m_auth = st.text_input("👥 作者群 (請用 '&' 或逗號分隔)", key="m_auth_val", placeholder="例如: 王小明, & 李大華 或 Smith, J., & Doe, A.")
+        m_year = st.text_input("📅 出版年份", key="m_year_val", placeholder="例如: 2026")
+        m_title = st.text_area("📄 文章標題", key="m_title_val", placeholder="例如: 台灣護理師職場暴力之探討")
     with col2:
-        m_jou = st.text_input("📖 期刊名稱", placeholder="例如: 護理雜誌")
+        m_jou = st.text_input("📖 期刊名稱", key="m_jou_val", placeholder="例如: 護理雜誌")
         col2_1, col2_2, col2_3 = st.columns(3)
-        with col2_1: m_vol = st.text_input("📚 卷號 (Volume)", placeholder="例如: 70")
-        with col2_2: m_iss = st.text_input("🏷️ 期號 (Issue)", placeholder="例如: 2")
-        with col2_3: m_page = st.text_input("📑 頁碼", placeholder="例如: 12-24")
-        m_link = st.text_input("🔗 網址或 DOI (選填)", placeholder="例如: https://doi.org/10.xxxx")
+        with col2_1: m_vol = st.text_input("📚 卷號 (Volume)", key="m_vol_val", placeholder="例如: 70")
+        with col2_2: m_iss = st.text_input("🏷️ 期號 (Issue)", key="m_iss_val", placeholder="例如: 2")
+        with col2_3: m_page = st.text_input("📑 頁碼", key="m_page_val", placeholder="例如: 12-24")
+        m_link = st.text_input("🔗 網址或 DOI (選填)", key="m_link_val", placeholder="例如: https://doi.org/10.xxxx")
 
-    if st.button("✨ 手動組合三合一格式"):
-        if m_auth and m_title:
-            m_ref = build_apa7(m_auth, m_year, m_title, m_jou, m_vol, m_iss, m_page, m_link)
-            # 簡易判定文中引用姓氏
-            last_names = [n for n in re.split(r'[,&和]+', m_auth) if n.strip()]
-            m_paren, m_narr = build_in_text(last_names, m_year)
+    if st.button("✨ 確認無誤，手動組合三合一格式"):
+        # 從 session_state 讀取最新修改的值
+        current_auth = st.session_state.m_auth_val
+        current_title = st.session_state.m_title_val
+        
+        if current_auth and current_title:
+            m_ref = build_apa7(
+                current_auth, st.session_state.m_year_val, current_title, 
+                st.session_state.m_jou_val, st.session_state.m_vol_val, 
+                st.session_state.m_iss_val, st.session_state.m_page_val, st.session_state.m_link_val
+            )
+            last_names = [n for n in re.split(r'[,&和]+', current_auth) if n.strip()]
+            m_paren, m_narr = build_in_text(last_names, st.session_state.m_year_val)
             
-            st.session_state.temp_manual = {"ref": m_ref, "paren": m_paren, "narr": m_narr, "author": m_auth}
+            st.session_state.temp_manual = {"ref": m_ref, "paren": m_paren, "narr": m_narr, "author": current_auth}
         else:
             st.warning("主角：至少要填寫『作者』跟『標題』我才能排版啦！")
 
-    # 展示手動輸入的「三合一」結果
     if st.session_state.temp_manual:
         st.markdown("### ✨ 手動三合一結果")
         st.markdown("**📝 文末參考文獻**")
