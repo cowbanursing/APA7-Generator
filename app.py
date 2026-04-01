@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import re
 from bs4 import BeautifulSoup
+import cloudscraper
 
 # --- 1. 網頁基礎設定 ---
 st.set_page_config(page_title="APA 7 產生器 & 排序小幫手", page_icon="💉", layout="wide")
@@ -97,14 +98,17 @@ def fetch_crossref(doi):
             return ref, paren, narr, auth_str
     except: return None
 
-# --- 新增：DOI 降落傘機制 (抓取 Meta Tags) ---
+# --- DOI 降落傘機制：升級版 Cloudscraper 偽裝爬蟲 ---
 def fetch_doi_metadata_fallback(doi):
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    }
     url = f"https://doi.org/{doi}"
     try:
-        res = requests.get(url, headers=headers, allow_redirects=True, timeout=15)
+        # 建立突破防火牆的爬蟲實體，偽裝成 Windows Chrome
+        scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True})
+        headers = {
+            'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Referer': 'https://www.google.com/'
+        }
+        res = scraper.get(url, headers=headers, allow_redirects=True, timeout=20)
         if res.status_code != 200: return None
         
         soup = BeautifulSoup(res.text, 'html.parser')
@@ -117,7 +121,6 @@ def fetch_doi_metadata_fallback(doi):
         for tag in soup.find_all("meta", attrs={"name": "citation_author"}):
             auth_content = tag.get("content", "")
             if auth_content:
-                # 簡單處理中文或英文姓名拆分
                 parts = auth_content.split(',')
                 if len(parts) == 2:
                     raw_auths.append((parts[0].strip(), parts[1].strip()[0] if parts[1].strip() else ""))
@@ -181,13 +184,15 @@ def fetch_pubmed(pmid):
             return ref, paren, narr, auth_str
     except: return None
 
-# --- 華藝專用爬蟲函數 (手動區塊外掛) ---
+# --- 華藝懶人包：升級版 Cloudscraper 偽裝爬蟲 ---
 def fetch_airiti_autofill(url):
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    }
     try:
-        res = requests.get(url, headers=headers, timeout=15)
+        scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True})
+        headers = {
+            'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Referer': 'https://www.google.com/'
+        }
+        res = scraper.get(url, headers=headers, timeout=20)
         if res.status_code != 200: return {"error": f"伺服器阻擋了請求 (狀態碼: {res.status_code})"}
         
         doi_match = re.search(r'(10\.\d{4,9}/[-._;()/:a-zA-Z0-9]+)', res.text)
@@ -195,11 +200,10 @@ def fetch_airiti_autofill(url):
             doi = doi_match.group(1).rstrip('."\'<>/')
             c_res = fetch_crossref(doi)
             if not c_res:
-                c_res = fetch_doi_metadata_fallback(doi) # 連動降落傘機制
+                c_res = fetch_doi_metadata_fallback(doi)
             
             if c_res:
                 ref, paren, narr, auth_str = c_res
-                # 從產生的 ref 中簡單反推欄位，或是直接請使用者填寫
                 return {"auth": auth_str, "year": "請參考上方結果", "title": "已抓取 DOI 資料", "jou": "", "vol": "", "iss": "", "page": "", "link": f"https://doi.org/{doi}", "source": "DOI"}
 
         soup = BeautifulSoup(res.text, 'html.parser')
@@ -230,7 +234,7 @@ def fetch_airiti_autofill(url):
         if fp_tag and lp_tag: page = f"{fp_tag.get('content', '')}-{lp_tag.get('content', '')}"
         elif fp_tag: page = fp_tag.get('content', '')
 
-        if not title: return {"error": "網頁結構無法解析，請手動填寫喔！"}
+        if not title: return {"error": "網頁結構無法解析，防護牆可能太厚了，請手動填寫喔！"}
 
         return {"auth": auth_str, "year": year, "title": title, "jou": jou, "vol": vol, "iss": iss, "page": page, "link": url, "source": "HTML"}
     except Exception as e:
@@ -268,19 +272,18 @@ if page == "1. 產生成果 (自動/手動)":
         if not user_input:
             st.warning("主角：學長姐，你還沒貼網址啦！")
         else:
-            with st.spinner("主角正在翻箱倒櫃..."):
+            with st.spinner("主角正在換上偽裝服，潛入資料庫中..."):
                 doi_match = parse_doi(user_input)
                 pmid_match = parse_pubmed_id(user_input)
                 
                 if doi_match:
-                    # 第一關：Crossref
                     st.session_state.temp_fetch = fetch_crossref(doi_match)
                     if not st.session_state.temp_fetch:
-                        # 第二關：啟動降落傘機制 (網頁轉址 Meta 爬蟲)
+                        # 降落傘機制啟動
                         st.session_state.temp_fetch = fetch_doi_metadata_fallback(doi_match)
                     
                     if not st.session_state.temp_fetch: 
-                        st.error("主角：靠北，Crossref 找不到，連追蹤網頁也抓不到資料，這篇藏得太深了！")
+                        st.error("主角：靠北，這篇的防火牆連滿等偽裝服都過不去！試試看下方的華藝懶人包或手動輸入吧。")
                 
                 elif pmid_match:
                     st.session_state.temp_fetch = fetch_pubmed(pmid_match)
@@ -294,7 +297,7 @@ if page == "1. 產生成果 (自動/手動)":
 
     if st.session_state.temp_fetch:
         ref, paren, narr, auth_for_sort = st.session_state.temp_fetch
-        st.success("主角：搞定！幫您排好版了！")
+        st.success("主角：搞定！滿載而歸！")
         
         st.markdown("### ✨ 三合一結果展示")
         st.markdown("**📝 文末參考文獻 (Reference List)**")
@@ -309,17 +312,17 @@ if page == "1. 產生成果 (自動/手動)":
     st.divider()
     
     st.title("✍️ 完整版手動輸入 (附華藝懶人包)")
-    st.markdown("<div class='mascot-dialog'><b>主角：</b>如果是死都不讓我抓的文章，就在這裡填吧！有華藝網址也可以用我的外掛試試看！</div>", unsafe_allow_html=True)
+    st.markdown("<div class='mascot-dialog'><b>主角：</b>如果防火牆真的太厚，我們就在這裡自己拼！有華藝網址也可以先用外掛試水溫！</div>", unsafe_allow_html=True)
     
     with st.expander("🇹🇼 華藝懶人包 (Airiti Auto-fill) 試運轉", expanded=True):
-        st.write("把華藝的網址貼在下面，主角會嘗試幫你把下方的欄位填滿！")
+        st.write("把華藝的網址貼在下面，主角會披上偽裝服嘗試幫你把下方的欄位填滿！")
         airiti_url = st.text_input("華藝網址：", placeholder="例如: https://www.airitilibrary.com/Article/Detail?DocID=...")
         if st.button("🪄 嘗試自動填寫下方欄位"):
             if "airiti" in airiti_url.lower() or "doi.org" in airiti_url.lower():
                 with st.spinner("主角戴上鋼盔，準備衝撞華藝的防火牆..."):
                     res_data = fetch_airiti_autofill(airiti_url)
                     if "error" in res_data:
-                        st.error(f"主角：靠北，被擋下來了！錯誤訊息：{res_data['error']}")
+                        st.error(f"主角：靠北，裝備都被打壞了還是被擋下來！錯誤訊息：{res_data['error']}")
                     else:
                         st.success(f"主角：成功突圍！(資料來源: {res_data.get('source', '解析')}) 幫您把資料填在下方欄位了，請檢查修改！")
                         st.session_state.m_auth_val = res_data.get('auth', '')
