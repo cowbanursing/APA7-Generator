@@ -124,13 +124,15 @@ def fetch_pubmed(pmid):
 
 # --- 解決按鈕消失的 Callback 函數 ---
 def add_fetch_to_box():
+    # 修復 BUG：temp_fetch 是一個 Tuple (ref, paren, narr, auth_str)，所以用數字索引
     st.session_state.bib_list.append({
-        "ref": st.session_state.temp_fetch['ref'], 
-        "author": st.session_state.temp_fetch['author']
+        "ref": st.session_state.temp_fetch[0], 
+        "author": st.session_state.temp_fetch[3]
     })
     st.session_state.temp_fetch = None # 清除暫存畫面
 
 def add_manual_to_box():
+    # temp_manual 是一個 Dictionary，所以用字串索引
     st.session_state.bib_list.append({
         "ref": st.session_state.temp_manual['ref'], 
         "author": st.session_state.temp_manual['author']
