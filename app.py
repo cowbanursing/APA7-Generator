@@ -6,9 +6,13 @@ from bs4 import BeautifulSoup
 # --- 1. 網頁基礎設定 ---
 st.set_page_config(page_title="APA 7 產生器 & 排序小幫手", page_icon="💉", layout="wide")
 
-# 初始化文獻箱
+# 初始化所有的暫存區
 if 'bib_list' not in st.session_state:
     st.session_state.bib_list = []
+if 'temp_fetch' not in st.session_state:
+    st.session_state.temp_fetch = None
+if 'temp_manual' not in st.session_state:
+    st.session_state.temp_manual = None
 
 # 自訂 CSS：醫療綠風格
 st.markdown("""
@@ -21,13 +25,48 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 2. 核心邏輯 (API & 解析) ---
+# --- 2. 核心邏輯 (格式化與 API) ---
+def format_authors(raw_auths):
+    if not raw_auths: return "Anonymous", []
+    ref_auths = []
+    last_names = []
+    for last, init in raw_auths:
+        last_names.append(last)
+        if init: ref_auths.append(f"{last}, {init}.")
+        else: ref_auths.append(last)
+            
+    if len(ref_auths) == 1:
+        return ref_auths[0], last_names
+    elif len(ref_auths) == 2:
+        return f"{ref_auths[0]}, & {ref_auths[1]}", last_names
+    else:
+        return ", ".join(ref_auths[:-1]) + f", & {ref_auths[-1]}", last_names
+
+def build_in_text(last_names, year):
+    if not last_names:
+        return f"(Anonymous, {year})", f"Anonymous ({year})"
+    if len(last_names) == 1:
+        return f"({last_names[0]}, {year})", f"{last_names[0]} ({year})"
+    elif len(last_names) == 2:
+        return f"({last_names[0]} & {last_names[1]}, {year})", f"{last_names[0]} and {last_names[1]} ({year})"
+    else:
+        return f"({last_names[0]} et al., {year})", f"{last_names[0]} et al. ({year})"
+
+def build_apa7(auth, year, title, jou, vol, iss, page, link):
+    ref = f"{auth} ({year}). {title}. "
+    if jou: ref += f"*{jou}*"
+    if vol: ref += f", *{vol}*"
+    if iss: ref += f"({iss})"
+    if page: ref += f", {page}."
+    else: ref += "."
+    if link: ref += f" {link}"
+    return ref.replace("..", ".")
+
 def parse_doi(text):
     match = re.search(r'(10\.\d{4,9}/[-._;()/:A-Z0-9]+)', text, re.IGNORECASE)
     return match.group(1) if match else None
 
 def parse_pubmed_id(text):
-    # 抓取 PubMed 網址中的純數字 ID
     match = re.search(r'pubmed\.ncbi\.nlm\.nih\.gov/(\d+)', text)
     return match.group(1) if match else None
 
@@ -43,13 +82,16 @@ def fetch_crossref(doi):
             issue = data.get('issue', '')
             page = data.get('page', '')
             
-            authors = data.get('author', [])
-            auth_list = [f"{a.get('family', '')}, {a.get('given', '')[0]}." for a in authors if a.get('family')]
-            if not auth_list: auth_str = "Anonymous"
-            elif len(auth_list) == 1: auth_str = auth_list[0]
-            else: auth_str = ", ".join(auth_list[:-1]) + f", & {auth_list[-1]}"
+            raw_auths = []
+            for a in data.get('author', []):
+                family = a.get('family', '')
+                given = a.get('given', '')
+                if family: raw_auths.append((family, given[0] if given else ""))
             
-            return auth_str, year, title, journal, vol, issue, page, f"https://doi.org/{doi}"
+            auth_str, last_names = format_authors(raw_auths)
+            paren, narr = build_in_text(last_names, year)
+            ref = build_apa7(auth_str, year, title, journal, vol, issue, page, f"https://doi.org/{doi}")
+            return ref, paren, narr, auth_str
     except: return None
 
 def fetch_pubmed(pmid):
@@ -67,31 +109,33 @@ def fetch_pubmed(pmid):
             doi = data.get('elocationid', '').replace('doi: ', '')
             link = f"https://doi.org/{doi}" if doi.startswith('10.') else f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
             
-            authors = data.get('authors', [])
-            auth_list = []
-            for a in authors:
-                name_parts = a['name'].split(' ')
-                if len(name_parts) >= 2:
-                    auth_list.append(f"{name_parts[0]}, {name_parts[1][0]}.")
-                else:
-                    auth_list.append(name_parts[0])
+            raw_auths = []
+            for a in data.get('authors', []):
+                name = a.get('name', '')
+                parts = name.split(' ')
+                if len(parts) >= 2: raw_auths.append((parts[0], parts[1][0]))
+                elif name: raw_auths.append((name, ""))
             
-            if not auth_list: auth_str = "Anonymous"
-            elif len(auth_list) == 1: auth_str = auth_list[0]
-            else: auth_str = ", ".join(auth_list[:-1]) + f", & {auth_list[-1]}"
-            
-            return auth_str, year, title, journal, vol, issue, page, link
+            auth_str, last_names = format_authors(raw_auths)
+            paren, narr = build_in_text(last_names, year)
+            ref = build_apa7(auth_str, year, title, journal, vol, issue, page, link)
+            return ref, paren, narr, auth_str
     except: return None
 
-def build_apa7(auth, year, title, jou, vol, iss, page, link):
-    ref = f"{auth} ({year}). {title}. "
-    if jou: ref += f"*{jou}*"
-    if vol: ref += f", *{vol}*"
-    if iss: ref += f"({iss})"
-    if page: ref += f", {page}."
-    else: ref += "."
-    if link: ref += f" {link}"
-    return ref.replace("..", ".")
+# --- 解決按鈕消失的 Callback 函數 ---
+def add_fetch_to_box():
+    st.session_state.bib_list.append({
+        "ref": st.session_state.temp_fetch['ref'], 
+        "author": st.session_state.temp_fetch['author']
+    })
+    st.session_state.temp_fetch = None # 清除暫存畫面
+
+def add_manual_to_box():
+    st.session_state.bib_list.append({
+        "ref": st.session_state.temp_manual['ref'], 
+        "author": st.session_state.temp_manual['author']
+    })
+    st.session_state.temp_manual = None
 
 # --- 3. 側邊欄與導覽 ---
 with st.sidebar:
@@ -113,31 +157,38 @@ if page == "1. 產生成果 (自動/手動)":
             with st.spinner("主角正在翻箱倒櫃..."):
                 doi_match = parse_doi(user_input)
                 pmid_match = parse_pubmed_id(user_input)
-                result_data = None
                 
                 if doi_match:
-                    result_data = fetch_crossref(doi_match)
+                    st.session_state.temp_fetch = fetch_crossref(doi_match)
                 elif pmid_match:
-                    result_data = fetch_pubmed(pmid_match)
+                    st.session_state.temp_fetch = fetch_pubmed(pmid_match)
                 elif "airiti" in user_input.lower():
-                    st.error("主角：靠北，華藝的防護牆太厚了，我被擋在外面... 請學長姐直接把資料貼到下方『完整版手動區塊』！")
+                    st.error("主角：靠北，華藝的防護牆太厚了... 請學長姐直接把資料貼到下方『完整版手動區塊』！")
+                    st.session_state.temp_fetch = None
                 else:
-                    st.error("主角：這網址我看不太懂捏，裡面好像沒有 DOI 或 PMID，試試看手動輸入吧！")
-                
-                if result_data:
-                    auth, year, title, jou, vol, iss, page_num, link = result_data
-                    final_ref = build_apa7(auth, year, title, jou, vol, iss, page_num, link)
-                    st.success("主角：搞定！幫您排好版了！")
-                    st.markdown(f"**📝 預覽結果：**\n\n{final_ref}")
-                    
-                    if st.button("📥 加入我的文獻箱 (排序用)"):
-                        st.session_state.bib_list.append({"ref": final_ref, "author": auth})
-                        st.toast("主角：已經丟進文獻箱囉！")
+                    st.error("主角：這網址我看不太懂捏，試試看手動輸入吧！")
+                    st.session_state.temp_fetch = None
+
+    # 展示自動抓取的「三合一」結果
+    if st.session_state.temp_fetch:
+        ref, paren, narr, auth_for_sort = st.session_state.temp_fetch
+        st.success("主角：搞定！幫您排好版了！")
+        
+        st.markdown("### ✨ 三合一結果展示")
+        st.markdown("**📝 文末參考文獻 (Reference List)**")
+        st.code(ref, language="markdown")
+        st.markdown("**💬 括號式引用 (Parenthetical Citation)**")
+        st.code(paren, language="markdown")
+        st.markdown("**🗣️ 敘述式引用 (Narrative Citation)**")
+        st.code(narr, language="markdown")
+        
+        # 使用 callback 避免畫面重整資料消失
+        st.button("📥 加入我的文獻箱 (排序用)", on_click=add_fetch_to_box, type="primary")
 
     st.divider()
     
     st.title("✍️ 完整版手動輸入")
-    st.markdown("<div class='mascot-dialog'><b>主角：</b>如果是沒有 DOI 的老文章，或是死都不讓我抓的華藝，就在這裡手動填吧！欄位我都準備好了！</div>", unsafe_allow_html=True)
+    st.markdown("<div class='mascot-dialog'><b>主角：</b>如果是死都不讓我抓的文章，就在這裡手動填吧！欄位我都準備好了！</div>", unsafe_allow_html=True)
     
     col1, col2 = st.columns(2)
     with col1:
@@ -147,22 +198,33 @@ if page == "1. 產生成果 (自動/手動)":
     with col2:
         m_jou = st.text_input("📖 期刊名稱", placeholder="例如: 護理雜誌")
         col2_1, col2_2, col2_3 = st.columns(3)
-        with col2_1:
-            m_vol = st.text_input("📚 卷號 (Volume)", placeholder="例如: 70")
-        with col2_2:
-            m_iss = st.text_input("🏷️ 期號 (Issue)", placeholder="例如: 2")
-        with col2_3:
-            m_page = st.text_input("📑 頁碼", placeholder="例如: 12-24")
+        with col2_1: m_vol = st.text_input("📚 卷號 (Volume)", placeholder="例如: 70")
+        with col2_2: m_iss = st.text_input("🏷️ 期號 (Issue)", placeholder="例如: 2")
+        with col2_3: m_page = st.text_input("📑 頁碼", placeholder="例如: 12-24")
         m_link = st.text_input("🔗 網址或 DOI (選填)", placeholder="例如: https://doi.org/10.xxxx")
 
-    if st.button("✨ 手動組合並加入文獻箱"):
+    if st.button("✨ 手動組合三合一格式"):
         if m_auth and m_title:
-            manual_ref = build_apa7(m_auth, m_year, m_title, m_jou, m_vol, m_iss, m_page, m_link)
-            st.session_state.bib_list.append({"ref": manual_ref, "author": m_auth})
-            st.success("主角：手動排版完成！已經幫您丟進文獻箱了！")
-            st.markdown(f"**📝 預覽：**\n\n{manual_ref}")
+            m_ref = build_apa7(m_auth, m_year, m_title, m_jou, m_vol, m_iss, m_page, m_link)
+            # 簡易判定文中引用姓氏
+            last_names = [n for n in re.split(r'[,&和]+', m_auth) if n.strip()]
+            m_paren, m_narr = build_in_text(last_names, m_year)
+            
+            st.session_state.temp_manual = {"ref": m_ref, "paren": m_paren, "narr": m_narr, "author": m_auth}
         else:
             st.warning("主角：至少要填寫『作者』跟『標題』我才能排版啦！")
+
+    # 展示手動輸入的「三合一」結果
+    if st.session_state.temp_manual:
+        st.markdown("### ✨ 手動三合一結果")
+        st.markdown("**📝 文末參考文獻**")
+        st.code(st.session_state.temp_manual['ref'], language="markdown")
+        st.markdown("**💬 括號式引用**")
+        st.code(st.session_state.temp_manual['paren'], language="markdown")
+        st.markdown("**🗣️ 敘述式引用**")
+        st.code(st.session_state.temp_manual['narr'], language="markdown")
+        
+        st.button("📥 將手動文獻加入文獻箱", on_click=add_manual_to_box, type="primary")
 
 # --- 5. 頁面 2：排序小幫手 ---
 elif page == "2. 排序小幫手 (文獻箱)":
@@ -191,7 +253,7 @@ elif page == "2. 排序小幫手 (文獻箱)":
             en.sort(key=lambda x: x['author'].lower())
             sorted_list = en + cn
 
-        st.markdown("### 📋 最終成果 (請直接複製貼上 Word)")
+        st.markdown("### 📋 最終文末參考文獻 (請直接複製貼上 Word)")
         final_text = "\n\n".join([item['ref'] for item in sorted_list])
         st.code(final_text, language="markdown")
         
